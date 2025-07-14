@@ -1,0 +1,129 @@
+import pandas as pd
+import numpy as np
+import os
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
+import glob
+import uuid
+from pathlib import Path
+
+# Function to load Excel files from a directory
+def load_excel_files(directory):
+    excel_files = glob.glob(os.path.join(directory, "*.xlsx"))
+    dataframes = []
+    for file in excel_files:
+        df = pd.read_excel(file, dtype=str)  # Read as string to handle mixed types
+        dataframes.append(df)
+    return dataframes
+
+# Function to detect expected column patterns from good data
+def learn_column_patterns(good_data):
+    patterns = {}
+    for df in good_data:
+        for col in df.columns:
+            if col not in patterns:
+                patterns[col] = {'types': set(), 'values': set()}
+            # Analyze data types and sample values
+            for value in df[col].dropna():
+                try:
+                    float(value)  # Check if numeric
+                    patterns[col]['types'].add('numeric')
+                except:
+                    patterns[col]['types'].add('string')
+                patterns[col]['values'].add(str(value))
+    return patterns
+
+# Function to prepare features for ML model
+def prepare_features(df, patterns):
+    features = []
+    labels = []
+    for idx, row in df.iterrows():
+        row_features = []
+        is_misaligned = False
+        for col in df.columns:
+            value = row[col]
+            expected_types = patterns.get(col, {'types': set()})['types']
+            # Feature: Is the value missing?
+            row_features.append(1 if pd.isna(value) else 0)
+            # Feature: Does the value match expected type?
+            if pd.isna(value):
+                type_match = 0
+            else:
+                try:
+                    float(value)
+                    type_match = 1 if 'numeric' in expected_types else 0
+                except:
+                    type_match = 1 if 'string' in expected_types else 0
+                # Check if value is in an unexpected column
+                if not pd.isna(value):
+                    for other_col in df.columns:
+                        if other_col != col:
+                            if str(value) in patterns.get(other_col, {'values': set()})['values']:
+                                is_misaligned = True
+            row_features.append(type_match)
+        features.append(row_features)
+        labels.append(1 if is_misaligned else 0)
+    return np.array(features), np.array(labels)
+
+# Function to realign a row based on patterns
+def realign_row(row, patterns, columns):
+    aligned_row = row.copy()
+    for i, col in enumerate(columns):
+        value = row[col]
+        if pd.isna(value):
+            continue
+        # Check if value belongs to another column
+        for target_col in columns:
+            if target_col != col:
+                if str(value) in patterns.get(target_col, {'values': set()})['values']:
+                    aligned_row[target_col] = value
+                    aligned_row[col] = np.nan
+                    break
+    return aligned_row
+
+# Main function to process and align Excel files
+def align_excel_files(good_dir, bad_dir, output_dir):
+    # Create output directory if it doesn't exist
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Load good and bad data
+    good_data = load_excel_files(good_dir)
+    bad_data = load_excel_files(bad_dir)
+
+    # Learn patterns from good data
+    patterns = learn_column_patterns(good_data)
+
+    # Prepare training data
+    X_train, y_train = [], []
+    for df in good_data:
+        X, y = prepare_features(df, patterns)
+        X_train.extend(X)
+        y_train.extend(y)
+
+    # Train ML model
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+
+    # Process bad data
+    for idx, df in enumerate(bad_data):
+        # Prepare features for prediction
+        X_test, _ = prepare_features(df, patterns)
+        predictions = model.predict(X_test)
+
+        # Realign rows where misalignment is detected
+        corrected_df = df.copy()
+        for i, pred in enumerate(predictions):
+            if pred == 1:  # Misaligned row
+                corrected_df.iloc[i] = realign_row(df.iloc[i], patterns, df.columns)
+
+        # Save corrected Excel file
+        output_path = os.path.join(output_dir, f"corrected_{uuid.uuid4()}.xlsx")
+        corrected_df.to_excel(output_path, index=False)
+        print(f"Corrected file saved: {output_path}")
+
+# Example usage
+if __name__ == "__main__":
+    good_data_dir = "path/to/good_excel_files"  # Replace with actual path
+    bad_data_dir = "path/to/bad_excel_files"    # Replace with actual path
+    output_dir = "path/to/output_corrected"      # Replace with actual path
+    align_excel_files(good_data_dir, bad_data_dir, output_dir)
