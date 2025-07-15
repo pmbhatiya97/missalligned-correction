@@ -128,6 +128,19 @@ class ExcelAutomationTool(QMainWindow):
         move_right_button.clicked.connect(self.move_right)
         control_layout.addWidget(move_right_button)
         
+        move_up_button = QPushButton("↑ Move Up")
+        move_up_button.clicked.connect(self.move_up)
+        control_layout.addWidget(move_up_button)
+        
+        move_down_button = QPushButton("Move Down ↓")
+        move_down_button.clicked.connect(self.move_down)
+        control_layout.addWidget(move_down_button)
+        
+        # Delete button
+        delete_button = QPushButton("Delete")
+        delete_button.clicked.connect(self.delete_selected)
+        control_layout.addWidget(delete_button)
+        
         # Undo button
         undo_button = QPushButton("Undo")
         undo_button.clicked.connect(self.undo)
@@ -137,10 +150,14 @@ class ExcelAutomationTool(QMainWindow):
         self.selection_info_label = QLabel("Selection: None")
         control_layout.addWidget(self.selection_info_label)
         
-        # Approve and generate buttons
+        # Approve, manual, and generate buttons
         approve_button = QPushButton("Approve")
         approve_button.clicked.connect(self.approve_changes)
         control_layout.addWidget(approve_button)
+        
+        manual_button = QPushButton("Manual")
+        manual_button.clicked.connect(self.save_manual)
+        control_layout.addWidget(manual_button)
         
         generate_button = QPushButton("Generate Excel")
         generate_button.clicked.connect(self.generate_excel)
@@ -317,7 +334,7 @@ class ExcelAutomationTool(QMainWindow):
         self.save_state()
         self.highlight_selected_cells()
         self.update_selection_display()
-        self.logger.info(f"Selection changed: {len(self.selected_cells)} cells selected")
+        self.logger.info(f"Selection changed: {len(self.selected_cells)} cells selected: {self.selected_cells}")
 
     def on_cell_double_click(self, row, col):
         if col == 0:
@@ -390,12 +407,18 @@ class ExcelAutomationTool(QMainWindow):
             self.selection_info_label.setText(f"Selection: {len(self.selected_cells)} cells")
 
     def move_left(self):
-        self.move_data(-1)
+        self.move_data(-1, horizontal=True)
 
     def move_right(self):
-        self.move_data(1)
+        self.move_data(1, horizontal=True)
 
-    def move_data(self, direction):
+    def move_up(self):
+        self.move_data(-1, horizontal=False)
+
+    def move_down(self):
+        self.move_data(1, horizontal=False)
+
+    def move_data(self, direction, horizontal=True):
         if not self.selected_cells:
             self.status_label.setText("Please select cells to move")
             self.logger.warning("Move attempted with no cells selected")
@@ -406,32 +429,109 @@ class ExcelAutomationTool(QMainWindow):
             moves_made = 0
             updated_cells = []
             
-            for row, col in sorted(self.selected_cells, key=lambda x: x[1]):
-                col_name = self.column_headers[col]
-                current_value = self.current_df.loc[row, col_name]
-                current_col_idx = col - 1
-                target_col_idx = current_col_idx + direction
-                
-                if target_col_idx < 0 or target_col_idx >= len(self.current_df.columns):
-                    continue
-                
-                target_col_name = self.current_df.columns[target_col_idx]
-                self.current_df.loc[row, col_name] = None
-                self.current_df.loc[row, target_col_name] = current_value
-                moves_made += 1
-                updated_cells.append((row, col + direction))
-                self.logger.info(f"Moved cell ({row}, {col_name}) to ({row}, {target_col_name})")
+            # Sort cells to avoid overwriting conflicts
+            if horizontal:
+                key = lambda x: (x[1], x[0])  # Sort by column, then row
+            else:
+                key = lambda x: (x[0], x[1])  # Sort by row, then column
+            sorted_cells = sorted(self.selected_cells, key=key)
+            
+            if horizontal:
+                for row, col in sorted_cells:
+                    col_name = self.column_headers[col]
+                    current_value = self.current_df.loc[row, col_name]
+                    current_col_idx = col - 1
+                    target_col_idx = current_col_idx + direction
+                    
+                    if target_col_idx < 0 or target_col_idx >= len(self.current_df.columns):
+                        continue
+                    
+                    target_col_name = self.current_df.columns[target_col_idx]
+                    self.current_df.loc[row, col_name] = None
+                    self.current_df.loc[row, target_col_name] = current_value
+                    moves_made += 1
+                    updated_cells.append((row, col + direction))
+                    self.logger.info(f"Moved cell ({row}, {col_name}) to ({row}, {target_col_name})")
+            else:
+                for row, col in sorted_cells:
+                    col_name = self.column_headers[col]
+                    current_value = self.current_df.loc[row, col_name]
+                    target_row = row + direction
+                    
+                    if target_row < 0 or target_row >= len(self.current_df):
+                        continue
+                    
+                    self.current_df.loc[row, col_name] = None
+                    self.current_df.loc[target_row, col_name] = current_value
+                    moves_made += 1
+                    updated_cells.append((target_row, col))
+                    self.logger.info(f"Moved cell ({row}, {col_name}) to ({target_row}, {col_name})")
             
             self.selected_cells = updated_cells
             self.load_data_to_table()
             self.highlight_selected_cells()
-            direction_text = "left" if direction == -1 else "right"
+            direction_text = "left" if direction == -1 and horizontal else "right" if direction == 1 and horizontal else "up" if direction == -1 else "down"
             self.status_label.setText(f"Moved {moves_made} cells {direction_text}")
             self.logger.info(f"Moved {moves_made} cells {direction_text}")
             
         except Exception as e:
             self.status_label.setText(f"Error moving data: {str(e)}")
             self.logger.error(f"Error moving data: {str(e)}")
+
+    def delete_selected(self):
+        if not self.selected_cells:
+            self.status_label.setText("Please select cells to delete")
+            self.logger.warning("Delete attempted with no cells selected")
+            return
+        
+        try:
+            self.save_state()
+            
+            # Determine if entire rows or columns are selected
+            selected_rows = set(row for row, col in self.selected_cells)
+            selected_cols = set(col for row, col in self.selected_cells)
+            all_rows = set(range(self.table.rowCount()))
+            all_cols = set(range(1, self.table.columnCount()))
+            
+            # Check for full row selection
+            rows_to_delete = []
+            for row in selected_rows:
+                if all((row, col) in self.selected_cells for col in all_cols):
+                    rows_to_delete.append(row)
+            
+            # Check for full column selection
+            cols_to_delete = []
+            for col in selected_cols:
+                if all((row, col) in self.selected_cells for row in all_rows):
+                    cols_to_delete.append(self.column_headers[col])
+            
+            if rows_to_delete and len(rows_to_delete) == len(selected_rows):
+                # Delete entire rows
+                self.current_df.drop(index=rows_to_delete, inplace=True)
+                self.current_df.reset_index(drop=True, inplace=True)
+                self.status_label.setText(f"Deleted {len(rows_to_delete)} rows")
+                self.logger.info(f"Deleted rows: {rows_to_delete}")
+            elif cols_to_delete and len(cols_to_delete) == len(selected_cols):
+                # Delete entire columns
+                self.current_df.drop(columns=cols_to_delete, inplace=True)
+                self.status_label.setText(f"Deleted {len(cols_to_delete)} columns")
+                self.logger.info(f"Deleted columns: {cols_to_delete}")
+            else:
+                # Delete individual cells
+                for row, col in self.selected_cells:
+                    col_name = self.column_headers[col]
+                    self.current_df.loc[row, col_name] = None
+                    self.logger.info(f"Deleted cell ({row}, {col_name})")
+                self.status_label.setText(f"Deleted {len(self.selected_cells)} cells")
+            
+            self.selected_cells = []
+            self.load_data_to_table()
+            self.highlight_selected_cells()
+            self.update_selection_display()
+            
+        except Exception as e:
+            self.status_label.setText(f"Error deleting: {str(e)}")
+            self.logger.error(f"Error deleting: {str(e)}")
 
     def approve_changes(self):
         if self.current_df is None:
@@ -441,6 +541,45 @@ class ExcelAutomationTool(QMainWindow):
         
         self.status_label.setText("Changes approved")
         self.logger.info("Changes approved")
+
+    def save_manual(self):
+        if self.current_df is None:
+            self.status_label.setText("No data to save")
+            self.logger.warning("Manual save attempted with no data")
+            return
+        
+        try:
+            # Log DataFrame state before saving
+            self.logger.info(f"Saving manual Excel for {self.current_filename}. DataFrame shape: {self.current_df.shape}")
+            self.logger.debug(f"DataFrame head:\n{self.current_df.head().to_string()}")
+            
+            # Validate DataFrame against table
+            for row in range(self.table.rowCount()):
+                for col in range(1, self.table.columnCount()):
+                    table_item = self.table.item(row, col)
+                    table_value = table_item.text() if table_item else ""
+                    df_value = str(self.current_df.iloc[row, col-1]) if pd.notna(self.current_df.iloc[row, col-1]) else ""
+                    if table_value != df_value:
+                        self.logger.warning(f"Mismatch at ({row}, {self.column_headers[col]}): Table='{table_value}', DF='{df_value}'")
+            
+            manual_folder = os.path.join(self.output_folder, "manual")
+            os.makedirs(manual_folder, exist_ok=True)
+            output_filename = self.current_filename
+            output_path = os.path.join(manual_folder, output_filename)
+            
+            # Save DataFrame to Excel
+            self.current_df.to_excel(output_path, index=False, engine='openpyxl')
+            
+            # Verify file was created
+            if os.path.exists(output_path):
+                self.status_label.setText(f"Saved to manual: {output_filename}")
+                self.logger.info(f"Saved manual output file: {output_path}")
+            else:
+                raise Exception("Manual output file was not created")
+                
+        except Exception as e:
+            self.status_label.setText(f"Error saving manual Excel: {str(e)}")
+            self.logger.error(f"Error saving manual Excel: {str(e)}")
 
     def generate_excel(self):
         if self.current_df is None:
@@ -490,8 +629,12 @@ class ExcelAutomationTool(QMainWindow):
             self.table,
             self.data_page.findChild(QPushButton, "← Move Left"),
             self.data_page.findChild(QPushButton, "Move Right →"),
+            self.data_page.findChild(QPushButton, "↑ Move Up"),
+            self.data_page.findChild(QPushButton, "Move Down ↓"),
+            self.data_page.findChild(QPushButton, "Delete"),
             self.data_page.findChild(QPushButton, "Undo"),
             self.data_page.findChild(QPushButton, "Approve"),
+            self.data_page.findChild(QPushButton, "Manual"),
             self.data_page.findChild(QPushButton, "Generate Excel")
         ]
         for control in controls:
