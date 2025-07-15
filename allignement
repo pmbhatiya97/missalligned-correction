@@ -1,10 +1,11 @@
 import sys
+import shutil
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QLineEdit, QTabWidget, QTableWidget,
     QTableWidgetItem, QAbstractItemView, QHeaderView, QScrollBar
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QItemSelection, QItemSelectionModel
 from PyQt5.QtGui import QColor
 import pandas as pd
 import os
@@ -31,6 +32,7 @@ class ExcelAutomationTool(QMainWindow):
         self.history = []
         self.max_history = 50
         self.selection_start = None  # Track drag selection start
+        self.last_edited_cell = None  # Track last edited/moved cell
         
         # Setup logging
         self.setup_logging()
@@ -121,28 +123,40 @@ class ExcelAutomationTool(QMainWindow):
         
         # Movement buttons
         move_left_button = QPushButton("← Move Left")
+        move_left_button.setShortcut("Ctrl+Left")
+        move_left_button.setToolTip("Move selected cells left (Ctrl+Left)")
         move_left_button.clicked.connect(self.move_left)
         control_layout.addWidget(move_left_button)
         
         move_right_button = QPushButton("Move Right →")
+        move_right_button.setShortcut("Ctrl+Right")
+        move_right_button.setToolTip("Move selected cells right (Ctrl+Right)")
         move_right_button.clicked.connect(self.move_right)
         control_layout.addWidget(move_right_button)
         
         move_up_button = QPushButton("↑ Move Up")
+        move_up_button.setShortcut("Ctrl+Up")
+        move_up_button.setToolTip("Move selected cells up (Ctrl+Up)")
         move_up_button.clicked.connect(self.move_up)
         control_layout.addWidget(move_up_button)
         
         move_down_button = QPushButton("Move Down ↓")
+        move_down_button.setShortcut("Ctrl+Down")
+        move_down_button.setToolTip("Move selected cells down (Ctrl+Down)")
         move_down_button.clicked.connect(self.move_down)
         control_layout.addWidget(move_down_button)
         
         # Delete button
         delete_button = QPushButton("Delete")
+        delete_button.setShortcut("Delete")
+        delete_button.setToolTip("Delete selected cells, rows, or columns (Delete)")
         delete_button.clicked.connect(self.delete_selected)
         control_layout.addWidget(delete_button)
         
         # Undo button
         undo_button = QPushButton("Undo")
+        undo_button.setShortcut("Ctrl+Z")
+        undo_button.setToolTip("Undo last action (Ctrl+Z)")
         undo_button.clicked.connect(self.undo)
         control_layout.addWidget(undo_button)
         
@@ -152,14 +166,20 @@ class ExcelAutomationTool(QMainWindow):
         
         # Approve, manual, and generate buttons
         approve_button = QPushButton("Approve")
+        approve_button.setShortcut("Ctrl+A")
+        approve_button.setToolTip("Approve changes (Ctrl+A)")
         approve_button.clicked.connect(self.approve_changes)
         control_layout.addWidget(approve_button)
         
         manual_button = QPushButton("Manual")
+        manual_button.setShortcut("Ctrl+M")
+        manual_button.setToolTip("Save to manual folder (Ctrl+M)")
         manual_button.clicked.connect(self.save_manual)
         control_layout.addWidget(manual_button)
         
         generate_button = QPushButton("Generate Excel")
+        generate_button.setShortcut("Ctrl+G")
+        generate_button.setToolTip("Generate Excel file (Ctrl+G)")
         generate_button.clicked.connect(self.generate_excel)
         control_layout.addWidget(generate_button)
         
@@ -170,10 +190,10 @@ class ExcelAutomationTool(QMainWindow):
         # Table widget for data display
         self.table = QTableWidget()
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.cellDoubleClicked.connect(self.on_cell_double_click)
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked)  # Enable in-place editing
         self.table.cellPressed.connect(self.on_cell_pressed)
         self.table.itemSelectionChanged.connect(self.on_selection_changed)
+        self.table.itemChanged.connect(self.on_item_changed)
         self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.horizontalHeader().customContextMenuRequested.connect(self.on_header_context_menu)
         self.table.horizontalHeader().sectionDoubleClicked.connect(self.on_header_double_click)
@@ -205,8 +225,11 @@ class ExcelAutomationTool(QMainWindow):
             return
         
         self.excel_files = []
+        completed_folder = Path(self.input_folder) / "original_input_completed"
         for ext in ['*.xlsx', '*.xls']:
-            self.excel_files.extend(Path(self.input_folder).glob(ext))
+            for file in Path(self.input_folder).glob(ext):
+                if completed_folder not in file.parents:
+                    self.excel_files.append(file)
         
         if not self.excel_files:
             QMessageBox.critical(self, "Error", "No Excel files found in the input folder")
@@ -235,6 +258,9 @@ class ExcelAutomationTool(QMainWindow):
                 self.save_state()
             
             self.current_df = pd.read_excel(current_file)
+            self.selected_cells = []  # Reset selection on file load
+            self.selection_start = None
+            self.last_edited_cell = None
             self.file_info_label.setText(f"File: {self.current_filename} ({self.current_file_index + 1}/{len(self.excel_files)})")
             self.status_label.setText("File loaded successfully")
             self.load_data_to_table()
@@ -252,7 +278,8 @@ class ExcelAutomationTool(QMainWindow):
                 'df': self.current_df.copy(),
                 'selected_cells': self.selected_cells.copy(),
                 'file_index': self.current_file_index,
-                'filename': self.current_filename
+                'filename': self.current_filename,
+                'last_edited_cell': self.last_edited_cell
             }
             self.history.append(state)
             if len(self.history) > self.max_history:
@@ -270,23 +297,31 @@ class ExcelAutomationTool(QMainWindow):
         self.selected_cells = prev_state['selected_cells']
         self.current_file_index = prev_state['file_index']
         self.current_filename = prev_state['filename']
+        self.last_edited_cell = prev_state['last_edited_cell']
         
         self.file_info_label.setText(f"File: {self.current_filename} ({self.current_file_index + 1}/{len(self.excel_files)})")
         self.load_data_to_table()
         self.highlight_selected_cells()
         self.update_selection_display()
+        if self.last_edited_cell:
+            row, col = self.last_edited_cell
+            self.table.setCurrentCell(row, col)
         self.status_label.setText("Undo successful")
         self.logger.info("Undo performed successfully")
 
     def load_data_to_table(self):
+        self.table.blockSignals(True)  # Prevent signals during load
         self.table.clear()
+        self.table.clearSelection()
         self.selected_cells = []
+        self.selection_start = None  # Reset selection start
         
         if self.current_df is None or self.current_df.empty:
             self.logger.warning("No data to display in table")
+            self.table.blockSignals(False)
             return
         
-        self.column_headers = ['Index'] + list(self.current_df.columns)
+        self.column_headers = list(self.current_df.columns)
         self.table.setColumnCount(len(self.column_headers))
         self.table.setRowCount(len(self.current_df))
         self.table.setHorizontalHeaderLabels(self.column_headers)
@@ -297,67 +332,72 @@ class ExcelAutomationTool(QMainWindow):
         
         # Populate table
         for row_idx, row in self.current_df.iterrows():
-            self.table.setItem(row_idx, 0, QTableWidgetItem(str(row_idx)))
             for col_idx, value in enumerate(row):
                 item = QTableWidgetItem(str(value) if pd.notna(value) else "")
-                self.table.setItem(row_idx, col_idx + 1, item)
+                self.table.setItem(row_idx, col_idx, item)
         
         self.table.resizeColumnsToContents()
         self.update_selection_display()
+        if self.last_edited_cell:
+            row, col = self.last_edited_cell
+            self.table.setCurrentCell(row, col)
+        self.table.blockSignals(False)
         self.logger.info(f"Loaded data to table with {len(self.column_headers)} columns")
 
     def on_cell_pressed(self, row, col):
-        if col == 0:
-            return
         self.selection_start = (row, col)
         self.logger.info(f"Cell pressed: ({row}, {col})")
 
     def on_selection_changed(self):
         modifiers = QApplication.keyboardModifiers()
         selected_items = self.table.selectedItems()
-        selected_cells = [(item.row(), item.column()) for item in selected_items if item.column() > 0]
+        new_selected_cells = [(item.row(), item.column()) for item in selected_items]
         
         if not modifiers & Qt.ControlModifier:
             # Mouse drag selection: restrict to same column as start
             if self.selection_start:
                 start_row, start_col = self.selection_start
-                self.selected_cells = [
-                    (r, start_col) for r, c in selected_cells
+                new_selected_cells = [
+                    (r, start_col) for r, c in new_selected_cells
                     if c == start_col and (r, start_col) not in self.selected_cells
                 ]
-            else:
-                self.selected_cells = selected_cells
+            self.selected_cells = new_selected_cells
         else:
             # Ctrl-click for non-contiguous selection
-            self.selected_cells = selected_cells
+            self.selected_cells = new_selected_cells
+        
+        # Force UI selection update
+        self.table.blockSignals(True)
+        self.table.clearSelection()
+        selection = QItemSelection()
+        for row, col in self.selected_cells:
+            index = self.table.model().index(row, col)
+            selection.select(index, index)
+        self.table.selectionModel().select(selection, QItemSelectionModel.Select)
+        self.table.blockSignals(False)
         
         self.save_state()
         self.highlight_selected_cells()
         self.update_selection_display()
         self.logger.info(f"Selection changed: {len(self.selected_cells)} cells selected: {self.selected_cells}")
+        self.logger.debug(f"New selected cells: {new_selected_cells}")
 
-    def on_cell_double_click(self, row, col):
-        if col == 0:
-            return
-        
+    def on_item_changed(self, item):
+        row = item.row()
+        col = item.column()
+        new_value = item.text()
         col_name = self.column_headers[col]
-        current_item = self.table.item(row, col)
-        current_value = current_item.text() if current_item else ""
+        old_value = str(self.current_df.loc[row, col_name]) if pd.notna(self.current_df.loc[row, col_name]) else ""
         
-        new_value, ok = QInputDialog.getText(
-            self, "Edit Cell Value", f"Edit value for '{col_name}':", text=current_value
-        )
-        if ok and new_value != current_value:
+        if new_value != old_value:
             self.save_state()
             self.current_df.loc[row, col_name] = new_value
-            self.table.setItem(row, col, QTableWidgetItem(new_value))
+            self.last_edited_cell = (row, col)
+            self.table.setCurrentCell(row, col)
             self.status_label.setText("Cell value updated")
             self.logger.info(f"Updated cell value in {col_name} at row {row} to '{new_value}'")
 
     def on_header_double_click(self, col):
-        if col <= 0:
-            return
-        
         col_name = self.column_headers[col]
         new_name, ok = QInputDialog.getText(
             self, "Edit Column Header", "New header name:", text=col_name
@@ -372,9 +412,6 @@ class ExcelAutomationTool(QMainWindow):
     def on_header_context_menu(self, pos):
         header = self.table.horizontalHeader()
         col = header.logicalIndexAt(pos)
-        if col <= 0:
-            return
-        
         col_name = self.column_headers[col]
         new_name, ok = QInputDialog.getText(
             self, "Edit Column Header", "New header name:", text=col_name
@@ -440,7 +477,7 @@ class ExcelAutomationTool(QMainWindow):
                 for row, col in sorted_cells:
                     col_name = self.column_headers[col]
                     current_value = self.current_df.loc[row, col_name]
-                    current_col_idx = col - 1
+                    current_col_idx = col
                     target_col_idx = current_col_idx + direction
                     
                     if target_col_idx < 0 or target_col_idx >= len(self.current_df.columns):
@@ -468,8 +505,22 @@ class ExcelAutomationTool(QMainWindow):
                     self.logger.info(f"Moved cell ({row}, {col_name}) to ({target_row}, {col_name})")
             
             self.selected_cells = updated_cells
+            self.selection_start = None  # Reset to allow new column selection
             self.load_data_to_table()
             self.highlight_selected_cells()
+            if updated_cells:
+                self.last_edited_cell = updated_cells[0]  # Set focus to first moved cell
+                row, col = self.last_edited_cell
+                self.table.setCurrentCell(row, col)
+                # Reselect moved cells
+                self.table.blockSignals(True)
+                self.table.clearSelection()
+                selection = QItemSelection()
+                for row, col in self.selected_cells:
+                    index = self.table.model().index(row, col)
+                    selection.select(index, index)
+                self.table.selectionModel().select(selection, QItemSelectionModel.Select)
+                self.table.blockSignals(False)
             direction_text = "left" if direction == -1 and horizontal else "right" if direction == 1 and horizontal else "up" if direction == -1 else "down"
             self.status_label.setText(f"Moved {moves_made} cells {direction_text}")
             self.logger.info(f"Moved {moves_made} cells {direction_text}")
@@ -491,7 +542,7 @@ class ExcelAutomationTool(QMainWindow):
             selected_rows = set(row for row, col in self.selected_cells)
             selected_cols = set(col for row, col in self.selected_cells)
             all_rows = set(range(self.table.rowCount()))
-            all_cols = set(range(1, self.table.columnCount()))
+            all_cols = set(range(self.table.columnCount()))
             
             # Check for full row selection
             rows_to_delete = []
@@ -525,6 +576,8 @@ class ExcelAutomationTool(QMainWindow):
                 self.status_label.setText(f"Deleted {len(self.selected_cells)} cells")
             
             self.selected_cells = []
+            self.last_edited_cell = None
+            self.selection_start = None
             self.load_data_to_table()
             self.highlight_selected_cells()
             self.update_selection_display()
@@ -555,10 +608,10 @@ class ExcelAutomationTool(QMainWindow):
             
             # Validate DataFrame against table
             for row in range(self.table.rowCount()):
-                for col in range(1, self.table.columnCount()):
+                for col in range(self.table.columnCount()):
                     table_item = self.table.item(row, col)
                     table_value = table_item.text() if table_item else ""
-                    df_value = str(self.current_df.iloc[row, col-1]) if pd.notna(self.current_df.iloc[row, col-1]) else ""
+                    df_value = str(self.current_df.iloc[row, col]) if pd.notna(self.current_df.iloc[row, col]) else ""
                     if table_value != df_value:
                         self.logger.warning(f"Mismatch at ({row}, {self.column_headers[col]}): Table='{table_value}', DF='{df_value}'")
             
@@ -594,10 +647,10 @@ class ExcelAutomationTool(QMainWindow):
             
             # Validate DataFrame against table
             for row in range(self.table.rowCount()):
-                for col in range(1, self.table.columnCount()):
+                for col in range(self.table.columnCount()):
                     table_item = self.table.item(row, col)
                     table_value = table_item.text() if table_item else ""
-                    df_value = str(self.current_df.iloc[row, col-1]) if pd.notna(self.current_df.iloc[row, col-1]) else ""
+                    df_value = str(self.current_df.iloc[row, col]) if pd.notna(self.current_df.iloc[row, col]) else ""
                     if table_value != df_value:
                         self.logger.warning(f"Mismatch at ({row}, {self.column_headers[col]}): Table='{table_value}', DF='{df_value}'")
             
@@ -611,12 +664,20 @@ class ExcelAutomationTool(QMainWindow):
             self.current_df.to_excel(output_path, index=False, engine='openpyxl')
             
             # Verify file was created
-            if os.path.exists(output_path):
-                self.status_label.setText(f"Generated: {output_filename}")
-                self.logger.info(f"Generated output file: {output_path}")
-            else:
+            if not os.path.exists(output_path):
                 raise Exception("Output file was not created")
-                
+            
+            # Move original input file to completed folder
+            completed_folder = os.path.join(self.input_folder, "original_input_completed")
+            os.makedirs(completed_folder, exist_ok=True)
+            original_path = str(self.excel_files[self.current_file_index])
+            completed_path = os.path.join(completed_folder, self.current_filename)
+            shutil.move(original_path, completed_path)
+            self.logger.info(f"Moved original file from {original_path} to {completed_path}")
+            
+            self.status_label.setText(f"Generated: {output_filename}")
+            self.logger.info(f"Generated output file: {output_path}")
+            
             self.current_file_index += 1
             self.load_current_file()
             
