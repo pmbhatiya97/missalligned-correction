@@ -1,129 +1,484 @@
+import sys
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QFileDialog, QLineEdit, QTabWidget, QTableWidget,
+    QTableWidgetItem, QAbstractItemView, QHeaderView, QScrollBar
+)
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QColor
 import pandas as pd
-import numpy as np
 import os
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
-import glob
-import uuid
 from pathlib import Path
+import logging
+from datetime import datetime
+from PyQt5.QtWidgets import QInputDialog, QMessageBox
 
-# Function to load Excel files from a directory
-def load_excel_files(directory):
-    excel_files = glob.glob(os.path.join(directory, "*.xlsx"))
-    dataframes = []
-    for file in excel_files:
-        df = pd.read_excel(file, dtype=str)  # Read as string to handle mixed types
-        dataframes.append(df)
-    return dataframes
+class ExcelAutomationTool(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Excel Semi-Automation Tool")
+        self.setGeometry(100, 100, 1200, 700)  # Adjusted for laptop screens
+        
+        # Variables for managing files and selections
+        self.input_folder = ""
+        self.output_folder = ""
+        self.excel_files = []
+        self.current_file_index = 0
+        self.current_df = None
+        self.current_filename = ""
+        self.selected_cells = []  # Stores (row, col) tuples
+        self.column_headers = []
+        self.history = []
+        self.max_history = 50
+        
+        # Setup logging
+        self.setup_logging()
+        
+        # Create UI
+        self.create_widgets()
 
-# Function to detect expected column patterns from good data
-def learn_column_patterns(good_data):
-    patterns = {}
-    for df in good_data:
-        for col in df.columns:
-            if col not in patterns:
-                patterns[col] = {'types': set(), 'values': set()}
-            # Analyze data types and sample values
-            for value in df[col].dropna():
-                try:
-                    float(value)  # Check if numeric
-                    patterns[col]['types'].add('numeric')
-                except:
-                    patterns[col]['types'].add('string')
-                patterns[col]['values'].add(str(value))
-    return patterns
+    def setup_logging(self):
+        # Configure logging to save operations to a timestamped file
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        log_file = log_dir / f"excel_tool_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+        self.logger.info("Excel Automation Tool started")
 
-# Function to prepare features for ML model
-def prepare_features(df, patterns):
-    features = []
-    labels = []
-    for idx, row in df.iterrows():
-        row_features = []
-        is_misaligned = False
-        for col in df.columns:
-            value = row[col]
-            expected_types = patterns.get(col, {'types': set()})['types']
-            # Feature: Is the value missing?
-            row_features.append(1 if pd.isna(value) else 0)
-            # Feature: Does the value match expected type?
-            if pd.isna(value):
-                type_match = 0
+    def create_widgets(self):
+        # Main widget and layout
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QVBoxLayout(main_widget)
+        
+        # Create tab widget
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+        
+        # Folder selection tab
+        self.folder_page = QWidget()
+        folder_layout = QVBoxLayout(self.folder_page)
+        self.tabs.addTab(self.folder_page, "Folder Selection")
+        
+        # Folder selection widgets
+        folder_widget = QWidget()
+        folder_layout.addWidget(folder_widget)
+        folder_inner_layout = QVBoxLayout(folder_widget)
+        
+        # Input folder
+        input_layout = QHBoxLayout()
+        input_label = QLabel("Input Folder:")
+        self.input_folder_edit = QLineEdit()
+        self.input_folder_edit.setReadOnly(True)
+        input_browse = QPushButton("Browse")
+        input_browse.clicked.connect(self.browse_input_folder)
+        input_layout.addWidget(input_label)
+        input_layout.addWidget(self.input_folder_edit)
+        input_layout.addWidget(input_browse)
+        folder_inner_layout.addLayout(input_layout)
+        
+        # Output folder
+        output_layout = QHBoxLayout()
+        output_label = QLabel("Output Folder:")
+        self.output_folder_edit = QLineEdit()
+        self.output_folder_edit.setReadOnly(True)
+        output_browse = QPushButton("Browse")
+        output_browse.clicked.connect(self.browse_output_folder)
+        output_layout.addWidget(output_label)
+        output_layout.addWidget(self.output_folder_edit)
+        output_layout.addWidget(output_browse)
+        folder_inner_layout.addLayout(output_layout)
+        
+        # Start processing button
+        start_button = QPushButton("Start Processing")
+        start_button.clicked.connect(self.start_processing)
+        folder_inner_layout.addWidget(start_button)
+        folder_inner_layout.addStretch()
+        
+        # Data view tab
+        self.data_page = QWidget()
+        data_layout = QVBoxLayout(self.data_page)
+        self.tabs.addTab(self.data_page, "Data View")
+        
+        # Control panel
+        control_widget = QWidget()
+        control_layout = QHBoxLayout(control_widget)
+        data_layout.addWidget(control_widget)
+        
+        # File info
+        self.file_info_label = QLabel("No file loaded")
+        control_layout.addWidget(self.file_info_label)
+        
+        # Movement buttons
+        move_left_button = QPushButton("← Move Left")
+        move_left_button.clicked.connect(self.move_left)
+        control_layout.addWidget(move_left_button)
+        
+        move_right_button = QPushButton("Move Right →")
+        move_right_button.clicked.connect(self.move_right)
+        control_layout.addWidget(move_right_button)
+        
+        # Undo button
+        undo_button = QPushButton("Undo")
+        undo_button.clicked.connect(self.undo)
+        control_layout.addWidget(undo_button)
+        
+        # Selection info
+        self.selection_info_label = QLabel("Selection: None")
+        control_layout.addWidget(self.selection_info_label)
+        
+        # Approve and generate buttons
+        approve_button = QPushButton("Approve")
+        approve_button.clicked.connect(self.approve_changes)
+        control_layout.addWidget(approve_button)
+        
+        generate_button = QPushButton("Generate Excel")
+        generate_button.clicked.connect(self.generate_excel)
+        control_layout.addWidget(generate_button)
+        
+        # Status label
+        self.status_label = QLabel("Select folders to begin")
+        data_layout.addWidget(self.status_label)
+        
+        # Table widget for data display
+        self.table = QTableWidget()
+        self.table.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.cellDoubleClicked.connect(self.on_cell_double_click)
+        self.table.cellClicked.connect(self.on_cell_click)
+        self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.horizontalHeader().customContextMenuRequested.connect(self.on_header_context_menu)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalScrollBar().setEnabled(True)
+        data_layout.addWidget(self.table)
+        
+        # Initially disable controls
+        self.toggle_controls(False)
+
+    def browse_input_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Input Folder")
+        if folder:
+            self.input_folder = folder
+            self.input_folder_edit.setText(folder)
+            self.logger.info(f"Selected input folder: {folder}")
+
+    def browse_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if folder:
+            self.output_folder = folder
+            self.output_folder_edit.setText(folder)
+            self.logger.info(f"Selected output folder: {folder}")
+
+    def start_processing(self):
+        if not self.input_folder or not self.output_folder:
+            QMessageBox.critical(self, "Error", "Please select both input and output folders")
+            self.logger.error("Start processing failed: Input or output folder not selected")
+            return
+        
+        self.excel_files = []
+        for ext in ['*.xlsx', '*.xls']:
+            self.excel_files.extend(Path(self.input_folder).glob(ext))
+        
+        if not self.excel_files:
+            QMessageBox.critical(self, "Error", "No Excel files found in the input folder")
+            self.logger.error("No Excel files found in input folder")
+            return
+        
+        self.current_file_index = 0
+        self.history = []
+        self.load_current_file()
+        self.toggle_controls(True)
+        self.tabs.setCurrentWidget(self.data_page)
+        self.logger.info("Started processing Excel files")
+
+    def load_current_file(self):
+        if self.current_file_index >= len(self.excel_files):
+            QMessageBox.information(self, "Complete", "All files have been processed!")
+            self.toggle_controls(False)
+            self.logger.info("All files processed")
+            return
+        
+        current_file = self.excel_files[self.current_file_index]
+        self.current_filename = current_file.name
+        
+        try:
+            if self.current_df is not None:
+                self.save_state()
+            
+            self.current_df = pd.read_excel(current_file)
+            self.file_info_label.setText(f"File: {self.current_filename} ({self.current_file_index + 1}/{len(self.excel_files)})")
+            self.status_label.setText("File loaded successfully")
+            self.load_data_to_table()
+            self.logger.info(f"Loaded file: {self.current_filename}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not load file {self.current_filename}: {str(e)}")
+            self.logger.error(f"Failed to load file {self.current_filename}: {str(e)}")
+            self.current_file_index += 1
+            self.load_current_file()
+
+    def save_state(self):
+        if self.current_df is not None:
+            state = {
+                'df': self.current_df.copy(),
+                'selected_cells': self.selected_cells.copy(),
+                'file_index': self.current_file_index,
+                'filename': self.current_filename
+            }
+            self.history.append(state)
+            if len(self.history) > self.max_history:
+                self.history.pop(0)
+            self.logger.info("Saved state for undo")
+
+    def undo(self):
+        if not self.history:
+            self.status_label.setText("No actions to undo")
+            self.logger.info("Undo attempted but no history available")
+            return
+        
+        prev_state = self.history.pop()
+        self.current_df = prev_state['df']
+        self.selected_cells = prev_state['selected_cells']
+        self.current_file_index = prev_state['file_index']
+        self.current_filename = prev_state['filename']
+        
+        self.file_info_label.setText(f"File: {self.current_filename} ({self.current_file_index + 1}/{len(self.excel_files)})")
+        self.load_data_to_table()
+        self.highlight_selected_cells()
+        self.update_selection_display()
+        self.status_label.setText("Undo successful")
+        self.logger.info("Undo performed successfully")
+
+    def load_data_to_table(self):
+        self.table.clear()
+        self.selected_cells = []
+        
+        if self.current_df is None or self.current_df.empty:
+            self.logger.warning("No data to display in table")
+            return
+        
+        self.column_headers = ['Index'] + list(self.current_df.columns)
+        self.table.setColumnCount(len(self.column_headers))
+        self.table.setRowCount(len(self.current_df))
+        self.table.setHorizontalHeaderLabels(self.column_headers)
+        
+        # Set column widths for scrolling
+        for col in range(len(self.column_headers)):
+            self.table.setColumnWidth(col, 200)  # Wide columns to ensure scrolling
+        
+        # Populate table
+        for row_idx, row in self.current_df.iterrows():
+            self.table.setItem(row_idx, 0, QTableWidgetItem(str(row_idx)))
+            for col_idx, value in enumerate(row):
+                item = QTableWidgetItem(str(value) if pd.notna(value) else "")
+                self.table.setItem(row_idx, col_idx + 1, item)
+        
+        self.table.resizeColumnsToContents()
+        self.update_selection_display()
+        self.logger.info(f"Loaded data to table with {len(self.column_headers)} columns")
+
+    def on_cell_click(self, row, col):
+        if col == 0:
+            return
+        
+        modifiers = QApplication.keyboardModifiers()
+        cell_id = (row, col)
+        
+        self.save_state()
+        if modifiers & Qt.ControlModifier:
+            if cell_id in self.selected_cells:
+                self.selected_cells.remove(cell_id)
             else:
-                try:
-                    float(value)
-                    type_match = 1 if 'numeric' in expected_types else 0
-                except:
-                    type_match = 1 if 'string' in expected_types else 0
-                # Check if value is in an unexpected column
-                if not pd.isna(value):
-                    for other_col in df.columns:
-                        if other_col != col:
-                            if str(value) in patterns.get(other_col, {'values': set()})['values']:
-                                is_misaligned = True
-            row_features.append(type_match)
-        features.append(row_features)
-        labels.append(1 if is_misaligned else 0)
-    return np.array(features), np.array(labels)
+                self.selected_cells.append(cell_id)
+        elif modifiers & Qt.ShiftModifier and self.selected_cells:
+            last_selected = self.selected_cells[-1]
+            last_row, last_col = last_selected
+            start_row = min(last_row, row)
+            end_row = max(last_row, row)
+            start_col = min(last_col, col)
+            end_col = max(last_col, col)
+            self.selected_cells = []
+            for r in range(start_row, end_row + 1):
+                for c in range(start_col, end_col + 1):
+                    if c > 0 and (r, c) not in self.selected_cells:
+                        self.selected_cells.append((r, c))
+        else:
+            self.selected_cells = [cell_id]
+        
+        self.highlight_selected_cells()
+        self.update_selection_display()
+        self.logger.info(f"Selected cell: {cell_id}")
 
-# Function to realign a row based on patterns
-def realign_row(row, patterns, columns):
-    aligned_row = row.copy()
-    for i, col in enumerate(columns):
-        value = row[col]
-        if pd.isna(value):
-            continue
-        # Check if value belongs to another column
-        for target_col in columns:
-            if target_col != col:
-                if str(value) in patterns.get(target_col, {'values': set()})['values']:
-                    aligned_row[target_col] = value
-                    aligned_row[col] = np.nan
-                    break
-    return aligned_row
+    def on_cell_double_click(self, row, col):
+        if col == 0:
+            return
+        
+        col_name = self.column_headers[col]
+        current_item = self.table.item(row, col)
+        current_value = current_item.text() if current_item else ""
+        
+        new_value, ok = QInputDialog.getText(
+            self, "Edit Cell Value", f"Edit value for '{col_name}':", text=current_value
+        )
+        if ok and new_value != current_value:
+            self.save_state()
+            self.current_df.loc[row, col_name] = new_value
+            self.table.setItem(row, col, QTableWidgetItem(new_value))
+            self.status_label.setText("Cell value updated")
+            self.logger.info(f"Updated cell value in {col_name} at row {row}")
 
-# Main function to process and align Excel files
-def align_excel_files(good_dir, bad_dir, output_dir):
-    # Create output directory if it doesn't exist
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    def on_header_context_menu(self, pos):
+        header = self.table.horizontalHeader()
+        col = header.logicalIndexAt(pos)
+        if col <= 0:
+            return
+        
+        col_name = self.column_headers[col]
+        new_name, ok = QInputDialog.getText(
+            self, "Edit Column Header", "New header name:", text=col_name
+        )
+        if ok and new_name and new_name != col_name:
+            self.save_state()
+            self.current_df.rename(columns={col_name: new_name}, inplace=True)
+            self.load_data_to_table()
+            self.status_label.setText(f"Column '{col_name}' renamed to '{new_name}'")
+            self.logger.info(f"Renamed column '{col_name}' to '{new_name}'")
 
-    # Load good and bad data
-    good_data = load_excel_files(good_dir)
-    bad_data = load_excel_files(bad_dir)
+    def highlight_selected_cells(self):
+        # Clear all highlights
+        for row in range(self.table.rowCount()):
+            for col in range(self.table.columnCount()):
+                item = self.table.item(row, col)
+                if item:
+                    item.setBackground(QColor("white"))
+        
+        # Highlight selected cells
+        for row, col in self.selected_cells:
+            item = self.table.item(row, col)
+            if item:
+                item.setBackground(QColor("lightblue"))
 
-    # Learn patterns from good data
-    patterns = learn_column_patterns(good_data)
+    def update_selection_display(self):
+        if not self.selected_cells:
+            self.selection_info_label.setText("Selection: None")
+        else:
+            self.selection_info_label.setText(f"Selection: {len(self.selected_cells)} cells")
 
-    # Prepare training data
-    X_train, y_train = [], []
-    for df in good_data:
-        X, y = prepare_features(df, patterns)
-        X_train.extend(X)
-        y_train.extend(y)
+    def move_left(self):
+        self.move_data(-1)
 
-    # Train ML model
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
-    model.fit(X_train, y_train)
+    def move_right(self):
+        self.move_data(1)
 
-    # Process bad data
-    for idx, df in enumerate(bad_data):
-        # Prepare features for prediction
-        X_test, _ = prepare_features(df, patterns)
-        predictions = model.predict(X_test)
+    def move_data(self, direction):
+        if not self.selected_cells:
+            self.status_label.setText("Please select cells to move")
+            self.logger.warning("Move attempted with no cells selected")
+            return
+        
+        try:
+            self.save_state()
+            moves_made = 0
+            updated_cells = []
+            
+            for row, col in sorted(self.selected_cells, key=lambda x: x[1]):
+                col_name = self.column_headers[col]
+                current_value = self.current_df.loc[row, col_name]
+                current_col_idx = col - 1
+                target_col_idx = current_col_idx + direction
+                
+                if target_col_idx < 0 or target_col_idx >= len(self.current_df.columns):
+                    continue
+                
+                target_col_name = self.current_df.columns[target_col_idx]
+                self.current_df.loc[row, col_name] = None
+                self.current_df.loc[row, target_col_name] = current_value
+                moves_made += 1
+                updated_cells.append((row, col + direction))
+            
+            self.selected_cells = updated_cells
+            self.load_data_to_table()
+            self.highlight_selected_cells()
+            direction_text = "left" if direction == -1 else "right"
+            self.status_label.setText(f"Moved {moves_made} cells {direction_text}")
+            self.logger.info(f"Moved {moves_made} cells {direction_text}")
+            
+        except Exception as e:
+            self.status_label.setText(f"Error moving data: {str(e)}")
+            self.logger.error(f"Error moving data: {str(e)}")
 
-        # Realign rows where misalignment is detected
-        corrected_df = df.copy()
-        for i, pred in enumerate(predictions):
-            if pred == 1:  # Misaligned row
-                corrected_df.iloc[i] = realign_row(df.iloc[i], patterns, df.columns)
+    def approve_changes(self):
+        if self.current_df is None:
+            self.status_label.setText("No data to approve")
+            self.logger.warning("Approve attempted with no data")
+            return
+        
+        self.status_label.setText("Changes approved")
+        self.logger.info("Changes approved")
 
-        # Save corrected Excel file
-        output_path = os.path.join(output_dir, f"corrected_{uuid.uuid4()}.xlsx")
-        corrected_df.to_excel(output_path, index=False)
-        print(f"Corrected file saved: {output_path}")
+    def generate_excel(self):
+        if self.current_df is None:
+            self.status_label.setText("No data to generate")
+            self.logger.warning("Generate Excel attempted with no data")
+            return
+        
+        try:
+            # Log DataFrame state before saving
+            self.logger.info(f"Generating Excel for {self.current_filename}. DataFrame shape: {self.current_df.shape}")
+            self.logger.debug(f"DataFrame head:\n{self.current_df.head().to_string()}")
+            
+            output_filename = self.current_filename
+            output_path = os.path.join(self.output_folder, output_filename)
+            
+            # Ensure output directory exists
+            os.makedirs(self.output_folder, exist_ok=True)
+            
+            # Save DataFrame to Excel
+            self.current_df.to_excel(output_path, index=False, engine='openpyxl')
+            
+            # Verify file was created
+            if os.path.exists(output_path):
+                self.status_label.setText(f"Generated: {output_filename}")
+                self.logger.info(f"Generated output file: {output_path}")
+            else:
+                raise Exception("Output file was not created")
+                
+            self.current_file_index += 1
+            self.load_current_file()
+            
+        except Exception as e:
+            self.status_label.setText(f"Error generating Excel: {str(e)}")
+            self.logger.error(f"Error generating Excel: {str(e)}")
 
-# Example usage
+    def toggle_controls(self, enabled):
+        controls = [
+            self.table,
+            self.data_page.findChild(QPushButton, "← Move Left"),
+            self.data_page.findChild(QPushButton, "Move Right →"),
+            self.data_page.findChild(QPushButton, "Undo"),
+            self.data_page.findChild(QPushButton, "Approve"),
+            self.data_page.findChild(QPushButton, "Generate Excel")
+        ]
+        for control in controls:
+            if control:
+                control.setEnabled(enabled)
+        self.status_label.setText("Ready to process files" if enabled else "Select folders to begin")
+        self.logger.info(f"Controls toggled to {'enabled' if enabled else 'disabled'}")
+
+def main():
+    app = QApplication(sys.argv)
+    window = ExcelAutomationTool()
+    window.show()
+    sys.exit(app.exec_())
+
 if __name__ == "__main__":
-    good_data_dir = "path/to/good_excel_files"  # Replace with actual path
-    bad_data_dir = "path/to/bad_excel_files"    # Replace with actual path
-    output_dir = "path/to/output_corrected"      # Replace with actual path
-    align_excel_files(good_data_dir, bad_data_dir, output_dir)
+    main()
